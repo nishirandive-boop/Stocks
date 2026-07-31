@@ -1033,7 +1033,7 @@ def main() -> None:
             f"""
             <div class="hero">
               <div class="live-pill"><span class="dot"></span> LIVE WORLD MARKETS · {now}</div>
-              <h1>Worldwide stock trends</h1>
+              <h1>🌍 Worldwide stock trends</h1>
               <p>Global indices, sector rotation, and regional day leaders — updated from live market data.
               Switch to <b>Invest my money</b> in the sidebar when you want a budgeted buy list.</p>
             </div>
@@ -1052,7 +1052,7 @@ def main() -> None:
             f"""
             <div class="hero">
               <div class="live-pill"><span class="dot"></span> LIVE STOCK PICKER · {now}</div>
-              <h1>Best stocks for your money</h1>
+              <h1>💰 Best stocks for your money</h1>
               <p>Enter your budget — we rank liquid global names from live market data and
               build a whole-share buy list that fits {fmt_money(budget, currency)}.</p>
             </div>
