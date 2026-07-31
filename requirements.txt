@@ -1,5 +1,6 @@
 streamlit>=1.33.0
 pandas>=2.0.0
 plotly>=5.18.0
+yfinance>=0.2.40
 streamlit-autorefresh>=1.0.1
 certifi>=2024.2.2
