@@ -1412,6 +1412,28 @@ def main() -> None:
             n_stocks = st.slider("Number of stocks", 1, 12, auto_n)
         st.caption("Live data via TradingView · delayed quotes · not advice")
         st.markdown("---")
+        with st.expander("💳 Where to invest"):
+            st.markdown(
+                """
+                **US brokers**
+                - [Fidelity](https://www.fidelity.com)
+                - [Charles Schwab](https://www.schwab.com)
+                - [Robinhood](https://robinhood.com)
+                - [Interactive Brokers](https://www.interactivebrokers.com)
+
+                **UK brokers**
+                - [Hargreaves Lansdown](https://www.hl.co.uk)
+                - [Freetrade](https://freetrade.io)
+                - [Trading 212](https://www.trading212.com)
+
+                **International / multi-region**
+                - [Interactive Brokers](https://www.interactivebrokers.com)
+                - [eToro](https://www.etoro.com)
+
+                *Availability, fees, and regulation vary by country. Compare before opening an account — not a recommendation.*
+                """
+            )
+        st.markdown("---")
         st.markdown("**By Nishi Randive**")
 
     now = datetime.now().strftime("%H:%M:%S")
