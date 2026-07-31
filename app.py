@@ -1,8 +1,11 @@
 """
-Global markets dashboard — worldwide trends + budget stock picker.
+Global markets dashboard — worldwide trends, budget picker, and paper tracker.
 
 Default view: live world indices, sectors, and regional movers.
-Second view: enter your capital and get a sized buy list.
+Invest view: enter capital and get a sized buy list.
+Tracker view: confirm a basket and track paper P&L daily (local files).
+
+Portfolio memory is stored in a local `data/` folder (gitignored) — not in GitHub.
 
 Run:
   pip install -r requirements.txt
@@ -17,7 +20,8 @@ import os
 import ssl
 import urllib.error
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
+from pathlib import Path
 from typing import Any
 
 import certifi
@@ -28,6 +32,50 @@ import streamlit as st
 
 os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+
+# Local-only persistence (keep off public GitHub via .gitignore)
+DATA_DIR = Path(__file__).resolve().parent / "data"
+PORTFOLIO_PATH = DATA_DIR / "portfolio.json"
+HISTORY_PATH = DATA_DIR / "history.json"
+
+
+def ensure_data_dir() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_portfolio() -> dict[str, Any] | None:
+    if not PORTFOLIO_PATH.exists():
+        return None
+    try:
+        return json.loads(PORTFOLIO_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def save_portfolio(portfolio: dict[str, Any]) -> None:
+    ensure_data_dir()
+    PORTFOLIO_PATH.write_text(json.dumps(portfolio, indent=2), encoding="utf-8")
+
+
+def load_history() -> list[dict[str, Any]]:
+    if not HISTORY_PATH.exists():
+        return []
+    try:
+        data = json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def save_history(history: list[dict[str, Any]]) -> None:
+    ensure_data_dir()
+    HISTORY_PATH.write_text(json.dumps(history, indent=2), encoding="utf-8")
+
+
+def clear_tracker_memory() -> None:
+    for path in (PORTFOLIO_PATH, HISTORY_PATH):
+        if path.exists():
+            path.unlink()
 
 st.set_page_config(
     page_title="Global Markets",
@@ -964,6 +1012,346 @@ def pick_card(rank: int, row: pd.Series, accent: str) -> str:
     """
 
 
+def quote_map_for_symbols(symbol_fulls: list[str]) -> dict[str, float]:
+    """Live last prices keyed by TradingView symbol."""
+    if not symbol_fulls:
+        return {}
+    cols = ["name", "close"]
+    raw = tv_quotes(symbol_fulls, columns=cols)
+    out: dict[str, float] = {}
+    by_full = {r["symbol_full"]: r for r in raw}
+    for sym in symbol_fulls:
+        row = by_full.get(sym)
+        if row and row.get("close") is not None:
+            out[sym] = float(row["close"])
+    return out
+
+
+def mark_portfolio(portfolio: dict[str, Any]) -> tuple[pd.DataFrame, float, float]:
+    """Return holdings table, market value (ex-cash), total equity."""
+    holdings = portfolio.get("holdings", [])
+    symbols = [h["symbol_full"] for h in holdings if h.get("symbol_full")]
+    prices = quote_map_for_symbols(symbols)
+    rows = []
+    mkt = 0.0
+    for h in holdings:
+        sym = h["symbol_full"]
+        entry = float(h["entry_price"])
+        shares = int(h["shares"])
+        last = prices.get(sym, entry)
+        value = shares * last
+        cost = shares * entry
+        mkt += value
+        rows.append(
+            {
+                "Ticker": h.get("ticker"),
+                "Name": h.get("name", ""),
+                "Shares": shares,
+                "Entry": entry,
+                "Last": last,
+                "Value": value,
+                "P&L": value - cost,
+                "P&L %": ((last / entry) - 1) * 100 if entry else 0.0,
+                "symbol_full": sym,
+            }
+        )
+    cash = float(portfolio.get("cash", 0))
+    equity = mkt + cash
+    return pd.DataFrame(rows), mkt, equity
+
+
+def record_daily_snapshot(portfolio: dict[str, Any], equity: float, holdings_df: pd.DataFrame) -> list[dict[str, Any]]:
+    """Append one snapshot per calendar day (local machine date)."""
+    history = load_history()
+    today = date.today().isoformat()
+    budget = float(portfolio.get("budget", 0))
+    pnl = equity - budget
+    pnl_pct = (pnl / budget * 100) if budget else 0.0
+    prices = {}
+    if not holdings_df.empty:
+        prices = {
+            str(r["Ticker"]): float(r["Last"])
+            for _, r in holdings_df.iterrows()
+            if pd.notna(r.get("Ticker"))
+        }
+    snap = {
+        "date": today,
+        "value": round(equity, 2),
+        "pnl": round(pnl, 2),
+        "pnl_pct": round(pnl_pct, 3),
+        "prices": prices,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+    # upsert today
+    history = [h for h in history if h.get("date") != today]
+    history.append(snap)
+    history.sort(key=lambda x: x.get("date", ""))
+    save_history(history)
+    return history
+
+
+def render_tracker_page() -> None:
+    st.subheader("Paper portfolio tracker")
+    st.caption(
+        "Suggest a basket → you confirm → we store it locally and mark it to market every day you open the app. "
+        f"Files live in `{DATA_DIR.name}/` on your machine (gitignored — not pushed to public GitHub)."
+    )
+
+    existing = load_portfolio()
+
+    with st.expander("How memory works (public GitHub)", expanded=False):
+        st.markdown(
+            """
+            - **Code** can be public on GitHub.
+            - **Your basket & daily P&L** are saved only in local files:
+              - `data/portfolio.json` — confirmed holdings
+              - `data/history.json` — one equity snapshot per day
+            - Those paths are in `.gitignore`, so they stay off GitHub.
+            - Tracking continues on **this computer** whenever you run the app (opens → fetch live prices → update today's point).
+            - Clearing the tracker deletes those local files only.
+            """
+        )
+
+    tab_track, tab_setup = st.tabs(["My tracked basket", "Suggest & confirm"])
+
+    with tab_setup:
+        st.markdown("##### Build a suggested basket")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            t_currency = st.selectbox("Currency", ["USD", "AED", "EUR", "GBP"], index=0, key="trk_cur")
+            t_budget = st.number_input(
+                "Paper budget",
+                min_value=50.0,
+                max_value=5_000_000.0,
+                value=float(existing.get("budget", 5000)) if existing else 5000.0,
+                step=100.0,
+                key="trk_budget",
+            )
+        with c2:
+            t_risk = st.selectbox("Risk", ["Conservative", "Balanced", "Aggressive"], index=1, key="trk_risk")
+            t_style = st.selectbox(
+                "Style",
+                ["Balanced", "Momentum", "Growth", "Value / income"],
+                index=0,
+                key="trk_style",
+            )
+        with c3:
+            t_regions = st.multiselect(
+                "Regions",
+                ["USA", "Europe", "UK", "Asia"],
+                default=["USA", "Europe"],
+                key="trk_regions",
+            )
+            t_n = st.slider("Stocks in basket", 1, 10, 4, key="trk_n")
+
+        if not t_regions:
+            st.warning("Pick at least one region.")
+        elif st.button("Suggest basket from live market", type="primary", key="trk_suggest"):
+            with st.spinner("Screening live markets for a basket…"):
+                try:
+                    uni = fetch_universe(tuple(t_regions), t_style, None)
+                    alloc = build_allocation(uni, t_budget, t_n, t_risk)
+                    st.session_state["tracker_suggestion"] = {
+                        "currency": t_currency,
+                        "budget": t_budget,
+                        "risk": t_risk,
+                        "style": t_style,
+                        "regions": t_regions,
+                        "alloc": alloc.to_dict(orient="records") if not alloc.empty else [],
+                    }
+                except Exception as exc:
+                    st.error(f"Could not build suggestion: {exc}")
+
+        suggestion = st.session_state.get("tracker_suggestion")
+        if suggestion and suggestion.get("alloc"):
+            alloc_df = pd.DataFrame(suggestion["alloc"])
+            st.markdown("##### Suggested basket — tick what you want to track")
+            show = alloc_df[
+                [c for c in ["ticker", "description", "price", "shares", "cost", "score", "region", "sector", "symbol_full"] if c in alloc_df.columns]
+            ].copy()
+            show.insert(0, "include", True)
+            edited = st.data_editor(
+                show,
+                use_container_width=True,
+                hide_index=True,
+                disabled=[c for c in show.columns if c != "include"],
+                column_config={
+                    "include": st.column_config.CheckboxColumn("Track?", default=True),
+                    "price": st.column_config.NumberColumn(format="%.2f"),
+                    "cost": st.column_config.NumberColumn(format="%.2f"),
+                    "score": st.column_config.NumberColumn(format="%.0f"),
+                },
+                key="trk_editor",
+            )
+            chosen = edited[edited["include"] == True]  # noqa: E712
+            if chosen.empty:
+                st.warning("Select at least one stock.")
+            else:
+                spent = float(chosen["cost"].sum()) if "cost" in chosen else 0.0
+                cash = max(0.0, float(suggestion["budget"]) - spent)
+                st.info(
+                    f"Selected **{len(chosen)}** names · invested ≈ **{fmt_money(spent, suggestion['currency'])}** · "
+                    f"cash left **{fmt_money(cash, suggestion['currency'])}**"
+                )
+                if st.button("Confirm selection & start daily tracking", type="primary", key="trk_confirm"):
+                    holdings = []
+                    for _, row in chosen.iterrows():
+                        holdings.append(
+                            {
+                                "ticker": str(row.get("ticker")),
+                                "symbol_full": str(row.get("symbol_full") or ""),
+                                "name": str(row.get("description") or ""),
+                                "sector": str(row.get("sector") or ""),
+                                "region": str(row.get("region") or ""),
+                                "shares": int(row.get("shares") or 0),
+                                "entry_price": float(row.get("price") or 0),
+                            }
+                        )
+                    holdings = [h for h in holdings if h["shares"] > 0 and h["symbol_full"]]
+                    if not holdings:
+                        st.error("No valid whole-share holdings to track.")
+                    else:
+                        portfolio = {
+                            "confirmed_at": datetime.now(timezone.utc).isoformat(),
+                            "currency": suggestion["currency"],
+                            "budget": float(suggestion["budget"]),
+                            "cash": cash,
+                            "risk": suggestion.get("risk"),
+                            "style": suggestion.get("style"),
+                            "regions": suggestion.get("regions"),
+                            "holdings": holdings,
+                        }
+                        save_portfolio(portfolio)
+                        # seed history with day-0
+                        hdf, _, equity = mark_portfolio(portfolio)
+                        record_daily_snapshot(portfolio, equity, hdf)
+                        st.success("Basket confirmed. Tracking started — open **My tracked basket**.")
+                        st.rerun()
+        elif suggestion is not None:
+            st.warning("Suggestion returned no buyable shares for that budget. Raise budget or change filters.")
+
+        if existing:
+            st.divider()
+            if st.button("Clear tracked basket & history", type="secondary", key="trk_clear"):
+                clear_tracker_memory()
+                st.session_state.pop("tracker_suggestion", None)
+                st.success("Local tracker memory cleared.")
+                st.rerun()
+
+    with tab_track:
+        portfolio = load_portfolio()
+        if not portfolio or not portfolio.get("holdings"):
+            st.info("No confirmed basket yet. Open **Suggest & confirm** to pick one.")
+            return
+
+        currency = portfolio.get("currency", "USD")
+        budget = float(portfolio.get("budget", 0))
+        confirmed = portfolio.get("confirmed_at", "")[:10]
+
+        try:
+            holdings_df, mkt, equity = mark_portfolio(portfolio)
+            history = record_daily_snapshot(portfolio, equity, holdings_df)
+        except Exception as exc:
+            st.error(f"Could not mark portfolio to market: {exc}")
+            return
+
+        cash = float(portfolio.get("cash", 0))
+        pnl = equity - budget
+        pnl_pct = (pnl / budget * 100) if budget else 0.0
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Paper budget", fmt_money(budget, currency))
+        k2.metric("Equity now", fmt_money(equity, currency), f"{pnl_pct:+.2f}% vs start")
+        k3.metric("Open P&L", fmt_money(pnl, currency))
+        k4.metric("Cash", fmt_money(cash, currency), f"since {confirmed}")
+
+        st.markdown(
+            f"""
+            <div class="alloc-box">
+              <b style="color:{C['gold']}">What-if tracker</b><br/>
+              If you had allocated <b>{fmt_money(budget, currency)}</b> on confirmation day,
+              this basket would now be worth <b>{fmt_money(equity, currency)}</b>
+              ({pnl_pct:+.2f}%). One snapshot is saved per day in local history when you open this page.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.dataframe(
+            holdings_df.drop(columns=["symbol_full"], errors="ignore"),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Entry": st.column_config.NumberColumn(format="%.2f"),
+                "Last": st.column_config.NumberColumn(format="%.2f"),
+                "Value": st.column_config.NumberColumn(format="%.2f"),
+                "P&L": st.column_config.NumberColumn(format="%+.2f"),
+                "P&L %": st.column_config.NumberColumn(format="%+.2f"),
+            },
+        )
+
+        if history:
+            hist_df = pd.DataFrame(history)
+            c1, c2 = st.columns(2)
+            with c1:
+                fig = go.Figure(
+                    go.Scatter(
+                        x=hist_df["date"],
+                        y=hist_df["value"],
+                        mode="lines+markers",
+                        line=dict(color=C["teal"], width=3),
+                        fill="tozeroy",
+                        fillcolor="rgba(0,194,168,0.15)",
+                        name="Equity",
+                    )
+                )
+                fig.add_hline(
+                    y=budget,
+                    line_dash="dash",
+                    line_color=C["gold"],
+                    annotation_text="Starting budget",
+                )
+                fig.update_layout(height=380)
+                st.plotly_chart(plot_layout(fig, "Daily paper equity"), use_container_width=True)
+            with c2:
+                fig = go.Figure(
+                    go.Bar(
+                        x=hist_df["date"],
+                        y=hist_df["pnl_pct"],
+                        marker_color=[
+                            C["lime"] if v >= 0 else C["coral"] for v in hist_df["pnl_pct"]
+                        ],
+                        name="P&L %",
+                    )
+                )
+                fig.update_layout(height=380)
+                st.plotly_chart(plot_layout(fig, "Daily P&L vs start (%)"), use_container_width=True)
+
+            st.markdown("##### Snapshot log")
+            st.dataframe(
+                hist_df[["date", "value", "pnl", "pnl_pct"]].rename(
+                    columns={
+                        "date": "Date",
+                        "value": "Equity",
+                        "pnl": "P&L",
+                        "pnl_pct": "P&L %",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Equity": st.column_config.NumberColumn(format="%.2f"),
+                    "P&L": st.column_config.NumberColumn(format="%+.2f"),
+                    "P&L %": st.column_config.NumberColumn(format="%+.2f"),
+                },
+            )
+
+        st.caption(
+            f"Memory files: `{PORTFOLIO_PATH}` · `{HISTORY_PATH}` · "
+            "Re-open the app each day (or leave auto-refresh on) to keep the curve up to date."
+        )
+
+
 def main() -> None:
     inject_css()
 
@@ -971,9 +1359,9 @@ def main() -> None:
         st.markdown("### Navigation")
         page = st.radio(
             "View",
-            ["World trends", "Invest my money"],
+            ["World trends", "Invest my money", "Tracker"],
             index=0,
-            help="Start with the global market pulse, then size a portfolio to your budget.",
+            help="Trends → pick stocks → confirm a basket and track paper P&L daily.",
         )
         st.divider()
         if st.button("Refresh market data", use_container_width=True):
@@ -1033,9 +1421,9 @@ def main() -> None:
             f"""
             <div class="hero">
               <div class="live-pill"><span class="dot"></span> LIVE WORLD MARKETS · {now}</div>
-              <h1>🌍 Worldwide stock trends</h1>
+              <h1>Worldwide stock trends</h1>
               <p>Global indices, sector rotation, and regional day leaders — updated from live market data.
-              Switch to <b>Invest my money</b> in the sidebar when you want a budgeted buy list.</p>
+              Switch to <b>Invest my money</b> or <b>Tracker</b> in the sidebar for picks and paper tracking.</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1047,12 +1435,12 @@ def main() -> None:
             "Educational tool only — not investment advice. Index/sector quotes are delayed "
             "exchange data from TradingView’s public scanner."
         )
-    else:
+    elif page == "Invest my money":
         st.markdown(
             f"""
             <div class="hero">
               <div class="live-pill"><span class="dot"></span> LIVE STOCK PICKER · {now}</div>
-              <h1>💰 Best stocks for your money</h1>
+              <h1>Best stocks for your money</h1>
               <p>Enter your budget — we rank liquid global names from live market data and
               build a whole-share buy list that fits {fmt_money(budget, currency)}.</p>
             </div>
@@ -1060,6 +1448,19 @@ def main() -> None:
             unsafe_allow_html=True,
         )
         render_invest_page(currency, budget, risk, style, regions, max_price, n_stocks)
+    else:
+        st.markdown(
+            f"""
+            <div class="hero">
+              <div class="live-pill"><span class="dot"></span> PAPER TRACKER · {now}</div>
+              <h1>Track your basket</h1>
+              <p>Confirm a suggested portfolio, then see what would have happened to your money —
+              marked to market daily and stored only on this machine.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        render_tracker_page()
 
     try:
         from streamlit_autorefresh import st_autorefresh
