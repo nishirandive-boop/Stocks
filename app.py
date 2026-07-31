@@ -1425,8 +1425,6 @@ def main() -> None:
                 *Fees and share dealing costs vary by platform. Compare before opening an account — not a recommendation.*
                 """
             )
-        st.markdown("---")
-        st.markdown("**By Nishi Randive**")
 
     now = datetime.now().strftime("%H:%M:%S")
 
