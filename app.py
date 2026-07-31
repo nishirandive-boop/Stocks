@@ -1415,22 +1415,14 @@ def main() -> None:
         with st.expander("💳 Where to invest"):
             st.markdown(
                 """
-                **US brokers**
-                - [Fidelity](https://www.fidelity.com)
-                - [Charles Schwab](https://www.schwab.com)
-                - [Robinhood](https://robinhood.com)
-                - [Interactive Brokers](https://www.interactivebrokers.com)
-
                 **UK brokers**
+                - [Vanguard Investor](https://www.vanguardinvestor.co.uk)
                 - [Hargreaves Lansdown](https://www.hl.co.uk)
                 - [Freetrade](https://freetrade.io)
                 - [Trading 212](https://www.trading212.com)
+                - [Interactive Brokers](https://www.interactivebrokers.co.uk)
 
-                **International / multi-region**
-                - [Interactive Brokers](https://www.interactivebrokers.com)
-                - [eToro](https://www.etoro.com)
-
-                *Availability, fees, and regulation vary by country. Compare before opening an account — not a recommendation.*
+                *Fees and share dealing costs vary by platform. Compare before opening an account — not a recommendation.*
                 """
             )
         st.markdown("---")
