@@ -608,8 +608,27 @@ def inject_css() -> None:
         .alloc-box, .alloc-box * {{
             color: {C["text"]} !important;
         }}
+        .credit-footer {{
+            position: fixed !important;
+            left: 1rem !important;
+            bottom: 0.85rem !important;
+            z-index: 2147483647 !important;
+            color: #e8f1ff !important;
+            font-size: 0.92rem !important;
+            font-weight: 700 !important;
+            letter-spacing: 0.02em !important;
+            background: rgba(14, 28, 47, 0.95) !important;
+            padding: 0.4rem 0.75rem !important;
+            border-radius: 8px !important;
+            border: 1px solid #1f3b5a !important;
+            pointer-events: none !important;
+        }}
         </style>
         """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="credit-footer">By Nishi Randive</div>',
         unsafe_allow_html=True,
     )
 
@@ -1004,6 +1023,8 @@ def main() -> None:
             auto_n = target_positions(budget)
             n_stocks = st.slider("Number of stocks", 1, 12, auto_n)
         st.caption("Live data via TradingView · delayed quotes · not advice")
+        st.markdown("---")
+        st.markdown("**By Nishi Randive**")
 
     now = datetime.now().strftime("%H:%M:%S")
 
