@@ -1,11 +1,12 @@
 """
-Global markets dashboard — worldwide trends, budget picker, and paper tracker.
+Global markets dashboard — worldwide trends, budget picker, and JSON portfolio tracker.
 
 Default view: live world indices, sectors, and regional movers.
-Invest view: enter capital and get a sized buy list.
-Tracker view: confirm a basket and track paper P&L daily (local files).
+Invest view: enter capital and get a sized buy list (download JSON on confirm).
+Tracker view: upload your portfolio JSON anytime for live P&L and window returns.
 
-Portfolio memory is stored in a local `data/` folder (gitignored) — not in GitHub.
+Your basket JSON stays with you — not auto-tracked in the app by default
+(safe for public GitHub code).
 
 Run:
   pip install -r requirements.txt
@@ -30,52 +31,14 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+import yfinance as yf
+
 os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
 
-# Local-only persistence (keep off public GitHub via .gitignore)
+# Optional local folder for downloads users save themselves (gitignored)
 DATA_DIR = Path(__file__).resolve().parent / "data"
-PORTFOLIO_PATH = DATA_DIR / "portfolio.json"
-HISTORY_PATH = DATA_DIR / "history.json"
-
-
-def ensure_data_dir() -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def load_portfolio() -> dict[str, Any] | None:
-    if not PORTFOLIO_PATH.exists():
-        return None
-    try:
-        return json.loads(PORTFOLIO_PATH.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
-
-
-def save_portfolio(portfolio: dict[str, Any]) -> None:
-    ensure_data_dir()
-    PORTFOLIO_PATH.write_text(json.dumps(portfolio, indent=2), encoding="utf-8")
-
-
-def load_history() -> list[dict[str, Any]]:
-    if not HISTORY_PATH.exists():
-        return []
-    try:
-        data = json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
-    except (json.JSONDecodeError, OSError):
-        return []
-
-
-def save_history(history: list[dict[str, Any]]) -> None:
-    ensure_data_dir()
-    HISTORY_PATH.write_text(json.dumps(history, indent=2), encoding="utf-8")
-
-
-def clear_tracker_memory() -> None:
-    for path in (PORTFOLIO_PATH, HISTORY_PATH):
-        if path.exists():
-            path.unlink()
+PORTFOLIO_VERSION = 1
 
 st.set_page_config(
     page_title="Global Markets",
@@ -123,6 +86,7 @@ TV_COLUMNS = [
     "Perf.W",
     "Perf.1M",
     "Perf.3M",
+    "Perf.6M",
     "Perf.YTD",
     "Perf.Y",
     "price_earnings_ttm",
@@ -1012,110 +976,414 @@ def pick_card(rank: int, row: pd.Series, accent: str) -> str:
     """
 
 
-def quote_map_for_symbols(symbol_fulls: list[str]) -> dict[str, float]:
-    """Live last prices keyed by TradingView symbol."""
-    if not symbol_fulls:
-        return {}
-    cols = ["name", "close"]
-    raw = tv_quotes(symbol_fulls, columns=cols)
-    out: dict[str, float] = {}
-    by_full = {r["symbol_full"]: r for r in raw}
-    for sym in symbol_fulls:
-        row = by_full.get(sym)
-        if row and row.get("close") is not None:
-            out[sym] = float(row["close"])
-    return out
+def yahoo_symbol_for(holding: dict[str, Any]) -> str:
+    """Best-effort Yahoo symbol from a portfolio holding."""
+    if holding.get("yahoo"):
+        return str(holding["yahoo"])
+    ticker = str(holding.get("ticker") or "").strip()
+    symbol_full = str(holding.get("symbol_full") or "")
+    if ticker:
+        return ticker.replace(".", "-")
+    if ":" in symbol_full:
+        return symbol_full.split(":", 1)[1].replace(".", "-")
+    return symbol_full.replace(".", "-")
 
 
-def mark_portfolio(portfolio: dict[str, Any]) -> tuple[pd.DataFrame, float, float]:
-    """Return holdings table, market value (ex-cash), total equity."""
+def build_portfolio_json(
+    *,
+    currency: str,
+    budget: float,
+    cash: float,
+    holdings_rows: list[dict[str, Any]],
+    risk: str | None = None,
+    style: str | None = None,
+    regions: list[str] | None = None,
+) -> dict[str, Any]:
+    """Canonical basket JSON the user downloads and later re-uploads."""
+    holdings = []
+    for row in holdings_rows:
+        shares = int(row.get("shares") or 0)
+        symbol_full = str(row.get("symbol_full") or "")
+        if shares <= 0 or not symbol_full:
+            continue
+        h = {
+            "ticker": str(row.get("ticker") or ""),
+            "symbol_full": symbol_full,
+            "yahoo": str(row.get("yahoo") or yahoo_symbol_for(row)),
+            "name": str(row.get("name") or row.get("description") or ""),
+            "sector": str(row.get("sector") or ""),
+            "region": str(row.get("region") or ""),
+            "shares": shares,
+            "entry_price": float(row.get("entry_price") or row.get("price") or 0),
+            "entry_date": str(row.get("entry_date") or date.today().isoformat()),
+        }
+        holdings.append(h)
+    return {
+        "version": PORTFOLIO_VERSION,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "currency": currency,
+        "budget": float(budget),
+        "cash": float(cash),
+        "risk": risk,
+        "style": style,
+        "regions": regions or [],
+        "holdings": holdings,
+    }
+
+
+def portfolio_to_download_bytes(portfolio: dict[str, Any]) -> bytes:
+    return json.dumps(portfolio, indent=2).encode("utf-8")
+
+
+def parse_uploaded_portfolio(raw: bytes | str) -> dict[str, Any]:
+    data = json.loads(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw)
+    if not isinstance(data, dict):
+        raise ValueError("JSON root must be an object.")
+    holdings = data.get("holdings")
+    if not isinstance(holdings, list) or not holdings:
+        raise ValueError("JSON must include a non-empty 'holdings' list.")
+    data.setdefault("currency", "USD")
+    data.setdefault("budget", 0)
+    data.setdefault("cash", 0)
+    data.setdefault("version", PORTFOLIO_VERSION)
+    return data
+
+
+def enrich_holdings_live(portfolio: dict[str, Any]) -> pd.DataFrame:
+    """Mark holdings to market + attach trailing performance fields from TradingView."""
     holdings = portfolio.get("holdings", [])
     symbols = [h["symbol_full"] for h in holdings if h.get("symbol_full")]
-    prices = quote_map_for_symbols(symbols)
+    cols = [
+        "name",
+        "close",
+        "change",
+        "Perf.1M",
+        "Perf.3M",
+        "Perf.6M",
+        "Perf.Y",
+        "Perf.YTD",
+        "dividends_yield",
+        "Volatility.D",
+        "price_earnings_ttm",
+        "market_cap_basic",
+    ]
+    raw = tv_quotes(symbols, columns=cols) if symbols else []
+    by_full = {r["symbol_full"]: r for r in raw}
     rows = []
-    mkt = 0.0
     for h in holdings:
-        sym = h["symbol_full"]
-        entry = float(h["entry_price"])
-        shares = int(h["shares"])
-        last = prices.get(sym, entry)
+        sym = h.get("symbol_full", "")
+        q = by_full.get(sym, {})
+        entry = float(h.get("entry_price") or 0)
+        shares = int(h.get("shares") or 0)
+        last = float(q["close"]) if q.get("close") is not None else entry
         value = shares * last
         cost = shares * entry
-        mkt += value
         rows.append(
             {
                 "Ticker": h.get("ticker"),
-                "Name": h.get("name", ""),
+                "Name": h.get("name") or q.get("name") or "",
+                "Sector": h.get("sector") or "",
+                "Region": h.get("region") or "",
                 "Shares": shares,
                 "Entry": entry,
                 "Last": last,
+                "Day %": q.get("change"),
                 "Value": value,
+                "Cost": cost,
                 "P&L": value - cost,
                 "P&L %": ((last / entry) - 1) * 100 if entry else 0.0,
+                "1M %": q.get("Perf.1M"),
+                "3M %": q.get("Perf.3M"),
+                "6M %": q.get("Perf.6M"),
+                "12M %": q.get("Perf.Y"),
+                "YTD %": q.get("Perf.YTD"),
+                "Div %": q.get("dividends_yield"),
+                "Vol %": q.get("Volatility.D"),
+                "P/E": q.get("price_earnings_ttm"),
                 "symbol_full": sym,
+                "yahoo": yahoo_symbol_for(h),
             }
         )
-    cash = float(portfolio.get("cash", 0))
+    df = pd.DataFrame(rows)
+    if not df.empty and df["Value"].sum():
+        df["Weight %"] = df["Value"] / df["Value"].sum() * 100
+    elif not df.empty:
+        df["Weight %"] = 0.0
+    return df
+
+
+def weighted_window_returns(holdings_df: pd.DataFrame) -> dict[str, float | None]:
+    """Portfolio trailing returns ≈ value-weighted average of holding perfs."""
+    out: dict[str, float | None] = {}
+    if holdings_df.empty:
+        return {"1M": None, "3M": None, "6M": None, "12M": None}
+    total = float(holdings_df["Value"].sum())
+    if total <= 0:
+        return {"1M": None, "3M": None, "6M": None, "12M": None}
+    for label, col in (("1M", "1M %"), ("3M", "3M %"), ("6M", "6M %"), ("12M", "12M %")):
+        wsum = 0.0
+        w = 0.0
+        for _, row in holdings_df.iterrows():
+            perf = row.get(col)
+            val = row.get("Value")
+            if perf is None or (isinstance(perf, float) and pd.isna(perf)):
+                continue
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                continue
+            wsum += float(val) * float(perf)
+            w += float(val)
+        out[label] = (wsum / w) if w > 0 else None
+    return out
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def portfolio_history_curve(holdings_json: str, cash: float, months: int = 12) -> pd.DataFrame:
+    """Daily paper equity curve from Yahoo history for current share counts."""
+    holdings = json.loads(holdings_json)
+    if not holdings:
+        return pd.DataFrame()
+    end = datetime.now()
+    start = end - timedelta(days=int(months * 31) + 10)
+    frames = []
+    for h in holdings:
+        ysym = yahoo_symbol_for(h)
+        shares = int(h.get("shares") or 0)
+        if shares <= 0 or not ysym:
+            continue
+        try:
+            hist = yf.Ticker(ysym).history(start=start.date(), end=end.date(), auto_adjust=True)
+            if hist.empty:
+                continue
+            s = hist["Close"].rename(ysym) * shares
+            frames.append(s)
+        except Exception:
+            continue
+    if not frames:
+        return pd.DataFrame()
+    prices = pd.concat(frames, axis=1).sort_index().ffill().dropna(how="all")
+    equity = prices.sum(axis=1) + float(cash)
+    out = equity.to_frame("equity")
+    out.index = pd.to_datetime(out.index).tz_localize(None)
+    return out
+
+
+def period_return_from_curve(curve: pd.DataFrame, days: int) -> float | None:
+    if curve is None or curve.empty or "equity" not in curve.columns:
+        return None
+    series = curve["equity"].dropna()
+    if len(series) < 2:
+        return None
+    end_v = float(series.iloc[-1])
+    target = series.index[-1] - pd.Timedelta(days=days)
+    past = series[series.index <= target]
+    if past.empty:
+        start_v = float(series.iloc[0])
+    else:
+        start_v = float(past.iloc[-1])
+    if start_v <= 0:
+        return None
+    return (end_v / start_v - 1) * 100
+
+
+def render_portfolio_analytics(portfolio: dict[str, Any]) -> None:
+    currency = portfolio.get("currency", "USD")
+    budget = float(portfolio.get("budget") or 0)
+    cash = float(portfolio.get("cash") or 0)
+
+    with st.spinner("Marking basket to live markets…"):
+        holdings_df = enrich_holdings_live(portfolio)
+
+    if holdings_df.empty:
+        st.error("No holdings could be priced.")
+        return
+
+    mkt = float(holdings_df["Value"].sum())
+    cost = float(holdings_df["Cost"].sum())
     equity = mkt + cash
-    return pd.DataFrame(rows), mkt, equity
+    basis = budget if budget > 0 else cost + cash
+    pnl = equity - basis
+    pnl_pct = (pnl / basis * 100) if basis else 0.0
 
-
-def record_daily_snapshot(portfolio: dict[str, Any], equity: float, holdings_df: pd.DataFrame) -> list[dict[str, Any]]:
-    """Append one snapshot per calendar day (local machine date)."""
-    history = load_history()
-    today = date.today().isoformat()
-    budget = float(portfolio.get("budget", 0))
-    pnl = equity - budget
-    pnl_pct = (pnl / budget * 100) if budget else 0.0
-    prices = {}
-    if not holdings_df.empty:
-        prices = {
-            str(r["Ticker"]): float(r["Last"])
-            for _, r in holdings_df.iterrows()
-            if pd.notna(r.get("Ticker"))
-        }
-    snap = {
-        "date": today,
-        "value": round(equity, 2),
-        "pnl": round(pnl, 2),
-        "pnl_pct": round(pnl_pct, 3),
-        "prices": prices,
-        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    windows_tv = weighted_window_returns(holdings_df)
+    holdings_payload = json.dumps(portfolio.get("holdings", []))
+    curve = portfolio_history_curve(holdings_payload, cash, months=12)
+    windows = {
+        "1M": period_return_from_curve(curve, 30) if not curve.empty else windows_tv.get("1M"),
+        "3M": period_return_from_curve(curve, 91) if not curve.empty else windows_tv.get("3M"),
+        "6M": period_return_from_curve(curve, 182) if not curve.empty else windows_tv.get("6M"),
+        "12M": period_return_from_curve(curve, 365) if not curve.empty else windows_tv.get("12M"),
     }
-    # upsert today
-    history = [h for h in history if h.get("date") != today]
-    history.append(snap)
-    history.sort(key=lambda x: x.get("date", ""))
-    save_history(history)
-    return history
+    for k, v in list(windows.items()):
+        if v is None:
+            windows[k] = windows_tv.get(k)
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Equity now", fmt_money(equity, currency))
+    k2.metric("Open P&L", fmt_money(pnl, currency), f"{pnl_pct:+.2f}% vs cost basis")
+    k3.metric("Invested (ex-cash)", fmt_money(mkt, currency))
+    k4.metric("Cash", fmt_money(cash, currency))
+
+    st.markdown("##### Trailing basket performance")
+    wcols = st.columns(4)
+    for i, label in enumerate(("1M", "3M", "6M", "12M")):
+        val = windows.get(label)
+        wcols[i].metric(f"Last {label}", "—" if val is None else f"{val:+.2f}%")
+
+    st.markdown(
+        f"""
+        <div class="alloc-box">
+          <b style="color:{C['gold']}">Uploaded basket</b><br/>
+          Created <b>{str(portfolio.get('created_at', '—'))[:19].replace('T', ' ')} UTC</b> ·
+          cost basis <b>{fmt_money(basis, currency)}</b> ·
+          live equity <b>{fmt_money(equity, currency)}</b>
+          ({pnl_pct:+.2f}%). Window returns use Yahoo price history when available,
+          otherwise value-weighted TradingView trailing performance.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.subheader("Current basket")
+    st.dataframe(
+        holdings_df.drop(columns=["symbol_full", "yahoo"], errors="ignore"),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Entry": st.column_config.NumberColumn(format="%.2f"),
+            "Last": st.column_config.NumberColumn(format="%.2f"),
+            "Value": st.column_config.NumberColumn(format="%.2f"),
+            "Cost": st.column_config.NumberColumn(format="%.2f"),
+            "P&L": st.column_config.NumberColumn(format="%+.2f"),
+            "P&L %": st.column_config.NumberColumn(format="%+.2f"),
+            "Weight %": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f%%"),
+            "Day %": st.column_config.NumberColumn(format="%+.2f"),
+            "1M %": st.column_config.NumberColumn(format="%+.2f"),
+            "3M %": st.column_config.NumberColumn(format="%+.2f"),
+            "6M %": st.column_config.NumberColumn(format="%+.2f"),
+            "12M %": st.column_config.NumberColumn(format="%+.2f"),
+            "YTD %": st.column_config.NumberColumn(format="%+.2f"),
+            "Div %": st.column_config.NumberColumn(format="%.2f"),
+            "Vol %": st.column_config.NumberColumn(format="%.2f"),
+            "P/E": st.column_config.NumberColumn(format="%.1f"),
+        },
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.pie(
+            holdings_df,
+            names="Ticker",
+            values="Value",
+            hole=0.45,
+            color_discrete_sequence=PALETTE,
+        )
+        st.plotly_chart(plot_layout(fig, "Allocation by market value"), use_container_width=True)
+    with c2:
+        fig = go.Figure(
+            go.Bar(
+                x=holdings_df["Ticker"],
+                y=holdings_df["P&L %"],
+                marker_color=[
+                    C["lime"] if pd.notna(v) and v >= 0 else C["coral"]
+                    for v in holdings_df["P&L %"]
+                ],
+                text=[f"{v:+.1f}%" if pd.notna(v) else "—" for v in holdings_df["P&L %"]],
+                textposition="outside",
+                cliponaxis=False,
+            )
+        )
+        fig.update_layout(height=380)
+        st.plotly_chart(plot_layout(fig, "Holding P&L vs entry (%)"), use_container_width=True)
+
+    if not curve.empty:
+        st.subheader("Hypothetical equity curve (last ~12 months)")
+        st.caption(
+            "Reprices today's share counts on historical closes (Yahoo). "
+            "This is a what-if path for the current basket, not your exact trade history."
+        )
+        fig = go.Figure(
+            go.Scatter(
+                x=curve.index,
+                y=curve["equity"],
+                mode="lines",
+                line=dict(color=C["teal"], width=2.5),
+                fill="tozeroy",
+                fillcolor="rgba(0,194,168,0.12)",
+                name="Equity",
+            )
+        )
+        if basis > 0:
+            fig.add_hline(y=basis, line_dash="dash", line_color=C["gold"], annotation_text="Cost basis")
+        fig.update_layout(height=400)
+        st.plotly_chart(plot_layout(fig, "Paper equity"), use_container_width=True)
+
+    st.subheader("Portfolio statistics")
+    best = holdings_df.loc[holdings_df["P&L %"].idxmax()] if len(holdings_df) else None
+    worst = holdings_df.loc[holdings_df["P&L %"].idxmin()] if len(holdings_df) else None
+    top_w = holdings_df.loc[holdings_df["Weight %"].idxmax()] if len(holdings_df) else None
+    avg_div = holdings_df["Div %"].dropna()
+    avg_vol = holdings_df["Vol %"].dropna()
+    s1, s2, s3, s4 = st.columns(4)
+    if best is not None:
+        s1.metric("Best vs entry", str(best["Ticker"]), f"{float(best['P&L %']):+.2f}%")
+    if worst is not None:
+        s2.metric("Worst vs entry", str(worst["Ticker"]), f"{float(worst['P&L %']):+.2f}%")
+    if top_w is not None:
+        s3.metric("Largest weight", str(top_w["Ticker"]), f"{float(top_w['Weight %']):.1f}%")
+    s4.metric(
+        "Holdings",
+        str(len(holdings_df)),
+        f"Div ~{avg_div.mean():.2f}%" if not avg_div.empty else "Div n/a",
+    )
+    if not avg_vol.empty:
+        st.caption(
+            f"Avg daily volatility proxy across names with data ≈ {avg_vol.mean():.2f}%."
+        )
 
 
 def render_tracker_page() -> None:
-    st.subheader("Paper portfolio tracker")
+    st.subheader("Portfolio tracker (JSON)")
     st.caption(
-        "Suggest a basket → you confirm → we store it locally and mark it to market every day you open the app. "
-        f"Files live in `{DATA_DIR.name}/` on your machine (gitignored — not pushed to public GitHub)."
+        "Confirm a basket → download `portfolio.json` → keep it with you (GitHub stays clean). "
+        "Upload that file anytime to see live P&L and 1/3/6/12‑month performance."
     )
 
-    existing = load_portfolio()
-
-    with st.expander("How memory works (public GitHub)", expanded=False):
+    with st.expander("How this works with public GitHub", expanded=False):
         st.markdown(
             """
-            - **Code** can be public on GitHub.
-            - **Your basket & daily P&L** are saved only in local files:
-              - `data/portfolio.json` — confirmed holdings
-              - `data/history.json` — one equity snapshot per day
-            - Those paths are in `.gitignore`, so they stay off GitHub.
-            - Tracking continues on **this computer** whenever you run the app (opens → fetch live prices → update today's point).
-            - Clearing the tracker deletes those local files only.
+            - The **app code** can be public.
+            - Your **basket lives in a JSON file you download** — you own that file.
+            - Nothing is auto-saved as the tracker default; upload when you want a status check.
+            - Keep the JSON private (local folder / private drive). Do not commit it to the public repo.
             """
         )
 
-    tab_track, tab_setup = st.tabs(["My tracked basket", "Suggest & confirm"])
+    tab_upload, tab_build = st.tabs(["Upload & track", "Suggest & download JSON"])
 
-    with tab_setup:
-        st.markdown("##### Build a suggested basket")
+    with tab_upload:
+        uploaded = st.file_uploader(
+            "Upload your portfolio JSON",
+            type=["json"],
+            accept_multiple_files=False,
+            key="portfolio_upload",
+        )
+        if uploaded is None:
+            st.info(
+                "No file yet. Build one under **Suggest & download JSON**, "
+                "or upload a JSON you saved earlier."
+            )
+        else:
+            try:
+                portfolio = parse_uploaded_portfolio(uploaded.getvalue())
+                st.success(
+                    f"Loaded **{len(portfolio.get('holdings', []))}** holdings from `{uploaded.name}`."
+                )
+                render_portfolio_analytics(portfolio)
+            except Exception as exc:
+                st.error(f"Could not read portfolio JSON: {exc}")
+
+    with tab_build:
+        st.markdown("##### Suggest a basket, confirm, then download JSON")
         c1, c2, c3 = st.columns(3)
         with c1:
             t_currency = st.selectbox("Currency", ["USD", "AED", "EUR", "GBP"], index=0, key="trk_cur")
@@ -1123,7 +1391,7 @@ def render_tracker_page() -> None:
                 "Paper budget",
                 min_value=50.0,
                 max_value=5_000_000.0,
-                value=float(existing.get("budget", 5000)) if existing else 5000.0,
+                value=5000.0,
                 step=100.0,
                 key="trk_budget",
             )
@@ -1159,16 +1427,30 @@ def render_tracker_page() -> None:
                         "regions": t_regions,
                         "alloc": alloc.to_dict(orient="records") if not alloc.empty else [],
                     }
+                    st.session_state.pop("confirmed_portfolio_json", None)
                 except Exception as exc:
                     st.error(f"Could not build suggestion: {exc}")
 
         suggestion = st.session_state.get("tracker_suggestion")
         if suggestion and suggestion.get("alloc"):
             alloc_df = pd.DataFrame(suggestion["alloc"])
-            st.markdown("##### Suggested basket — tick what you want to track")
-            show = alloc_df[
-                [c for c in ["ticker", "description", "price", "shares", "cost", "score", "region", "sector", "symbol_full"] if c in alloc_df.columns]
-            ].copy()
+            st.markdown("##### Suggested basket — tick what to include")
+            cols = [
+                c
+                for c in [
+                    "ticker",
+                    "description",
+                    "price",
+                    "shares",
+                    "cost",
+                    "score",
+                    "region",
+                    "sector",
+                    "symbol_full",
+                ]
+                if c in alloc_df.columns
+            ]
+            show = alloc_df[cols].copy()
             show.insert(0, "include", True)
             edited = st.data_editor(
                 show,
@@ -1176,7 +1458,7 @@ def render_tracker_page() -> None:
                 hide_index=True,
                 disabled=[c for c in show.columns if c != "include"],
                 column_config={
-                    "include": st.column_config.CheckboxColumn("Track?", default=True),
+                    "include": st.column_config.CheckboxColumn("Include?", default=True),
                     "price": st.column_config.NumberColumn(format="%.2f"),
                     "cost": st.column_config.NumberColumn(format="%.2f"),
                     "score": st.column_config.NumberColumn(format="%.0f"),
@@ -1193,163 +1475,54 @@ def render_tracker_page() -> None:
                     f"Selected **{len(chosen)}** names · invested ≈ **{fmt_money(spent, suggestion['currency'])}** · "
                     f"cash left **{fmt_money(cash, suggestion['currency'])}**"
                 )
-                if st.button("Confirm selection & start daily tracking", type="primary", key="trk_confirm"):
-                    holdings = []
+                if st.button("Confirm selection & generate JSON", type="primary", key="trk_confirm"):
+                    rows = []
                     for _, row in chosen.iterrows():
-                        holdings.append(
+                        rows.append(
                             {
-                                "ticker": str(row.get("ticker")),
-                                "symbol_full": str(row.get("symbol_full") or ""),
-                                "name": str(row.get("description") or ""),
-                                "sector": str(row.get("sector") or ""),
-                                "region": str(row.get("region") or ""),
-                                "shares": int(row.get("shares") or 0),
-                                "entry_price": float(row.get("price") or 0),
+                                "ticker": row.get("ticker"),
+                                "symbol_full": row.get("symbol_full"),
+                                "description": row.get("description"),
+                                "sector": row.get("sector"),
+                                "region": row.get("region"),
+                                "shares": row.get("shares"),
+                                "price": row.get("price"),
                             }
                         )
-                    holdings = [h for h in holdings if h["shares"] > 0 and h["symbol_full"]]
-                    if not holdings:
-                        st.error("No valid whole-share holdings to track.")
+                    portfolio = build_portfolio_json(
+                        currency=suggestion["currency"],
+                        budget=float(suggestion["budget"]),
+                        cash=cash,
+                        holdings_rows=rows,
+                        risk=suggestion.get("risk"),
+                        style=suggestion.get("style"),
+                        regions=suggestion.get("regions"),
+                    )
+                    if not portfolio["holdings"]:
+                        st.error("No valid whole-share holdings to export.")
                     else:
-                        portfolio = {
-                            "confirmed_at": datetime.now(timezone.utc).isoformat(),
-                            "currency": suggestion["currency"],
-                            "budget": float(suggestion["budget"]),
-                            "cash": cash,
-                            "risk": suggestion.get("risk"),
-                            "style": suggestion.get("style"),
-                            "regions": suggestion.get("regions"),
-                            "holdings": holdings,
-                        }
-                        save_portfolio(portfolio)
-                        # seed history with day-0
-                        hdf, _, equity = mark_portfolio(portfolio)
-                        record_daily_snapshot(portfolio, equity, hdf)
-                        st.success("Basket confirmed. Tracking started — open **My tracked basket**.")
-                        st.rerun()
+                        st.session_state["confirmed_portfolio_json"] = portfolio
+                        st.success("Basket confirmed — download your JSON below.")
+
         elif suggestion is not None:
-            st.warning("Suggestion returned no buyable shares for that budget. Raise budget or change filters.")
-
-        if existing:
-            st.divider()
-            if st.button("Clear tracked basket & history", type="secondary", key="trk_clear"):
-                clear_tracker_memory()
-                st.session_state.pop("tracker_suggestion", None)
-                st.success("Local tracker memory cleared.")
-                st.rerun()
-
-    with tab_track:
-        portfolio = load_portfolio()
-        if not portfolio or not portfolio.get("holdings"):
-            st.info("No confirmed basket yet. Open **Suggest & confirm** to pick one.")
-            return
-
-        currency = portfolio.get("currency", "USD")
-        budget = float(portfolio.get("budget", 0))
-        confirmed = portfolio.get("confirmed_at", "")[:10]
-
-        try:
-            holdings_df, mkt, equity = mark_portfolio(portfolio)
-            history = record_daily_snapshot(portfolio, equity, holdings_df)
-        except Exception as exc:
-            st.error(f"Could not mark portfolio to market: {exc}")
-            return
-
-        cash = float(portfolio.get("cash", 0))
-        pnl = equity - budget
-        pnl_pct = (pnl / budget * 100) if budget else 0.0
-
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Paper budget", fmt_money(budget, currency))
-        k2.metric("Equity now", fmt_money(equity, currency), f"{pnl_pct:+.2f}% vs start")
-        k3.metric("Open P&L", fmt_money(pnl, currency))
-        k4.metric("Cash", fmt_money(cash, currency), f"since {confirmed}")
-
-        st.markdown(
-            f"""
-            <div class="alloc-box">
-              <b style="color:{C['gold']}">What-if tracker</b><br/>
-              If you had allocated <b>{fmt_money(budget, currency)}</b> on confirmation day,
-              this basket would now be worth <b>{fmt_money(equity, currency)}</b>
-              ({pnl_pct:+.2f}%). One snapshot is saved per day in local history when you open this page.
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        st.dataframe(
-            holdings_df.drop(columns=["symbol_full"], errors="ignore"),
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Entry": st.column_config.NumberColumn(format="%.2f"),
-                "Last": st.column_config.NumberColumn(format="%.2f"),
-                "Value": st.column_config.NumberColumn(format="%.2f"),
-                "P&L": st.column_config.NumberColumn(format="%+.2f"),
-                "P&L %": st.column_config.NumberColumn(format="%+.2f"),
-            },
-        )
-
-        if history:
-            hist_df = pd.DataFrame(history)
-            c1, c2 = st.columns(2)
-            with c1:
-                fig = go.Figure(
-                    go.Scatter(
-                        x=hist_df["date"],
-                        y=hist_df["value"],
-                        mode="lines+markers",
-                        line=dict(color=C["teal"], width=3),
-                        fill="tozeroy",
-                        fillcolor="rgba(0,194,168,0.15)",
-                        name="Equity",
-                    )
-                )
-                fig.add_hline(
-                    y=budget,
-                    line_dash="dash",
-                    line_color=C["gold"],
-                    annotation_text="Starting budget",
-                )
-                fig.update_layout(height=380)
-                st.plotly_chart(plot_layout(fig, "Daily paper equity"), use_container_width=True)
-            with c2:
-                fig = go.Figure(
-                    go.Bar(
-                        x=hist_df["date"],
-                        y=hist_df["pnl_pct"],
-                        marker_color=[
-                            C["lime"] if v >= 0 else C["coral"] for v in hist_df["pnl_pct"]
-                        ],
-                        name="P&L %",
-                    )
-                )
-                fig.update_layout(height=380)
-                st.plotly_chart(plot_layout(fig, "Daily P&L vs start (%)"), use_container_width=True)
-
-            st.markdown("##### Snapshot log")
-            st.dataframe(
-                hist_df[["date", "value", "pnl", "pnl_pct"]].rename(
-                    columns={
-                        "date": "Date",
-                        "value": "Equity",
-                        "pnl": "P&L",
-                        "pnl_pct": "P&L %",
-                    }
-                ),
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Equity": st.column_config.NumberColumn(format="%.2f"),
-                    "P&L": st.column_config.NumberColumn(format="%+.2f"),
-                    "P&L %": st.column_config.NumberColumn(format="%+.2f"),
-                },
+            st.warning(
+                "Suggestion returned no buyable shares for that budget. Raise budget or change filters."
             )
 
-        st.caption(
-            f"Memory files: `{PORTFOLIO_PATH}` · `{HISTORY_PATH}` · "
-            "Re-open the app each day (or leave auto-refresh on) to keep the curve up to date."
-        )
+        confirmed = st.session_state.get("confirmed_portfolio_json")
+        if confirmed:
+            fname = f"portfolio_{date.today().isoformat()}.json"
+            st.download_button(
+                label="Download portfolio JSON",
+                data=portfolio_to_download_bytes(confirmed),
+                file_name=fname,
+                mime="application/json",
+                type="primary",
+                key="trk_download",
+            )
+            preview = json.dumps(confirmed, indent=2)
+            st.code(preview[:2500] + ("\n…" if len(preview) > 2500 else ""))
+            st.caption("Keep this file. Later, open **Upload & track** and drop it in to see live P&L.")
 
 
 def main() -> None:
@@ -1361,7 +1534,7 @@ def main() -> None:
             "View",
             ["World trends", "Invest my money", "Tracker"],
             index=0,
-            help="Trends → pick stocks → confirm a basket and track paper P&L daily.",
+            help="Trends → pick stocks → download JSON → upload later to track.",
         )
         st.divider()
         if st.button("Refresh market data", use_container_width=True):
@@ -1464,10 +1637,10 @@ def main() -> None:
         st.markdown(
             f"""
             <div class="hero">
-              <div class="live-pill"><span class="dot"></span> PAPER TRACKER · {now}</div>
+              <div class="live-pill"><span class="dot"></span> JSON TRACKER · {now}</div>
               <h1>Track your basket</h1>
-              <p>Confirm a suggested portfolio, then see what would have happened to your money —
-              marked to market daily and stored only on this machine.</p>
+              <p>Upload the portfolio JSON you downloaded when you confirmed picks —
+              see live P&L, allocation, and 1/3/6/12‑month performance.</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1620,6 +1793,28 @@ def render_invest_page(
             "P/E": st.column_config.NumberColumn(format="%.1f"),
             "Tech rating": st.column_config.NumberColumn(format="%+.2f"),
         },
+    )
+
+    st.subheader("Confirm & download portfolio JSON")
+    st.caption(
+        "Download this basket file, then open **Tracker → Upload & track** whenever you want live P&L."
+    )
+    invest_portfolio = build_portfolio_json(
+        currency=currency,
+        budget=float(budget),
+        cash=float(cash),
+        holdings_rows=alloc.to_dict(orient="records"),
+        risk=risk,
+        style=style,
+        regions=regions,
+    )
+    st.download_button(
+        label="Download portfolio JSON",
+        data=portfolio_to_download_bytes(invest_portfolio),
+        file_name=f"portfolio_{date.today().isoformat()}.json",
+        mime="application/json",
+        type="primary",
+        key="invest_download_json",
     )
 
     c1, c2 = st.columns(2)
